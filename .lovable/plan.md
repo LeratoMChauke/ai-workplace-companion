@@ -1,89 +1,58 @@
-# AI Workplace Productivity Assistant — Build Plan
+# Voice + Translation for Meeting Notes Summarizer
 
-A modern SaaS-style dashboard with five AI modules, soft-blue Copilot-inspired theme, sidebar navigation, and localStorage-backed history. Chatbot supports multiple threads via dedicated routes.
+Add audio transcription and bidirectional translation to `/notes`. All AI work runs through the existing Lovable AI Gateway (Gemini multimodal). No new dependencies.
 
-## Stack & Foundations
-- TanStack Start + React 19 + Tailwind v4 (existing template)
-- Lovable AI Gateway via AI SDK (default model `google/gemini-3-flash-preview`), server boundary = TanStack server functions / chat route
-- AI Elements for the chatbot UI (`conversation`, `message`, `prompt-input`, `shimmer`, `tool`)
-- shadcn Sidebar for navigation
-- localStorage for all history (no auth, no database)
+## UX changes (src/routes/notes.tsx)
 
-## Design System
-Update `src/styles.css` tokens to the soft-blue Copilot palette:
-- background `#fafbff`, surface `#eef2ff`, foreground `#1f2937`, primary `#6366f1`
-- Rounded-xl cards, soft shadows, generous spacing
-- Inter font, accessible contrast, subtle transitions
+Input card gains a tabbed input:
+- **Text** tab — existing textarea.
+- **Audio** tab — drag-and-drop / file picker for `.mp3`, `.wav`, `.m4a`, `.webm`, `.ogg` (max ~20 MB). Shows filename + size, a "Transcribe" button, and a Shimmer while running. After transcription, the resulting text drops into the textarea (editable) and an inline badge shows the detected language (e.g. "Detected: Spanish"). The user can then click **Summarize** as today.
 
-## Routes (`src/routes/`)
-```
-__root.tsx              SidebarProvider + AppSidebar + header (app name, profile avatar, Responsible AI badge)
-index.tsx               Dashboard: greeting, module cards, recent outputs
-email.tsx               Smart Email Generator
-notes.tsx               Meeting Notes Summarizer
-planner.tsx             AI Task Planner
-research.tsx            AI Research Assistant
-chat.index.tsx          Chat landing → create/select thread
-chat.$threadId.tsx      Threaded chatbot (keyed by threadId)
-api/chat.ts             streamText server route for chatbot
-```
+Output card gains a language toggle above the summary:
+- Two pill buttons: **English** | **Original ({lang})**, disabled when detected language is already English.
+- Switching toggles between two cached summary objects; missing one triggers a translate call and caches the result on the same history entry.
 
-## Server Functions (`src/lib/ai/*.functions.ts`)
-One `createServerFn` per non-chat module, each calling `generateText` through the Lovable Gateway provider helper in `src/lib/ai-gateway.server.ts`:
-- `generateEmail` — inputs: purpose, recipient, context, tone (formal/casual/persuasive/friendly)
-- `summarizeNotes` — outputs structured summary, action items, decisions, deadlines (Output.object schema)
-- `planTasks` — outputs prioritized task list with deadlines + tips (Output.object)
-- `researchQuery` — outputs summary, key insights, bullets, with refine/expand mode
-- Chat handled by streaming `api/chat.ts` route with `useChat` client
+Recent summaries now store both `detectedLanguage`, `summary_en`, and `summary_original` so re-opening restores the toggle state.
 
-All server fns: zod input validation, surface 429/402 errors.
+## Server functions (new)
 
-## Module UI Pattern
-Each feature page is a card-based layout:
-- Left card: structured inputs (selects, textareas)
-- Right card: AI output area — editable textarea/rich result, loading shimmer, action bar (Copy, Download .txt/.md, Regenerate, Refine, Save to history)
-- Bottom: Recent outputs strip (localStorage)
+### `src/lib/ai/transcribe.functions.ts`
+- Input: `{ audioBase64: string, mimeType: string }` (validated with zod, size cap ~20 MB pre-encoded).
+- Calls Gemini multimodal via raw fetch to `https://ai.gateway.lovable.dev/v1/chat/completions` (the AI SDK's openai-compatible adapter rejects non-wav/mp3 audio parts; per `ai-multimodal-input` knowledge we POST the chat-completions body directly with `Lovable-API-Key`). Body uses `{ type: "input_audio", input_audio: { data, format } }`.
+- System prompt: "Transcribe the audio verbatim. Detect the spoken language. Return JSON `{ transcript, languageCode (BCP-47), languageName }`." Uses `response_format: { type: "json_object" }`.
+- Returns parsed JSON. Surfaces 402/429 errors clearly.
 
-## Chatbot
-- AI Elements composition: `Conversation` → `Message`/`MessageResponse`, `PromptInput` + `PromptInputTextarea` + `PromptInputFooter` + `PromptInputSubmit`, `Shimmer` "Thinking…"
-- Sidebar sub-list of threads with new-thread button and delete
-- Routes `/chat/$threadId`; threads + per-thread `UIMessage[]` stored in localStorage, keyed by threadId
-- Idempotent bootstrap: on `/chat` create or pick most recent thread, navigate to `/chat/$threadId`
-- Chat window keyed by `threadId`; passes `id: threadId` to `useChat`
+### `src/lib/ai/translate.functions.ts`
+- Input: `{ text: string, targetLanguage: "en" | string }`.
+- Uses existing AI SDK + `createLovableAiGatewayProvider` with `generateText` + `Output.object({ schema: z.object({ translated: z.string() }) })`.
+- Returns `{ translated }`.
 
-## History (localStorage)
-`src/lib/history.ts` — typed helpers per module:
-- `{ id, module, title, input, output, createdAt }`
-- Dashboard "Recent outputs" reads across modules
-- Each module page lists its own history with re-open / delete
+### `src/lib/ai/notes.functions.ts` (updated)
+- Adds optional `language` input; system prompt instructs Gemini to write the summary fields in that language.
+- Adds `detectedLanguage` field to the returned schema (defaults to "en" / "English").
+- Returns `NotesSummary` unchanged in shape aside from added optional `detectedLanguage`.
+
+## Client flow
+
+1. User picks Audio tab → uploads file → `transcribeAudio({ audioBase64, mimeType })` → fills textarea, stores `detectedLanguage`.
+2. User clicks **Summarize** → `summarizeNotes({ notes, language: "en" })` produces `summary_en`. If detected language ≠ English, also (lazily on toggle click) call `summarizeNotes({ notes, language: detectedLanguageName })` for `summary_original`.
+3. Toggle swaps between cached summaries; "Copy / Download / Save" act on the currently-displayed one. Markdown filename includes language suffix.
+4. `saveHistory` stores `{ notes, detectedLanguage, summaryEn, summaryOriginal }`. `RecentList` re-open restores everything.
+
+## File reading helper
+
+Small client util `src/lib/audio.ts`:
+- `fileToBase64(file)` → reads as data URL, splits off `data:...;base64,`.
+- `mimeToFormat(mime)` → maps `audio/webm` → `webm`, `audio/mp4`/`audio/x-m4a` → `m4a`, `audio/mpeg` → `mp3`, `audio/wav`/`audio/x-wav` → `wav`, `audio/ogg` → `ogg`, fallback `webm`.
+- 20 MB guard with toast error.
 
 ## Responsible AI
-- Persistent footer banner + dismissible callout on each module: "AI outputs may be inaccurate — review before use. Do not share confidential data."
-- Same disclaimer shown in chat empty state
 
-## Components (`src/components/`)
-- `app-sidebar.tsx` (icons: Mail, FileText, ListChecks, Search, MessageSquare)
-- `app-header.tsx` (logo, avatar placeholder, theme)
-- `module-shell.tsx` (title, description, two-column responsive layout)
-- `output-actions.tsx` (copy/download/regenerate/save)
-- `recent-list.tsx`
-- `responsible-ai-banner.tsx`
-- AI Elements installed into `src/components/ai-elements/`
+Existing banner stays. Add a line in the Audio tab's helper text: "Audio is sent to Lovable AI for transcription and is not stored by the app."
 
-## Responsive
-- Sidebar collapses to icons on tablet, offcanvas trigger on mobile
-- Module two-column grid stacks under `md`
-- Header uses grid + min-w-0 pattern
+## Out of scope
 
-## Acceptance
-- All 5 modules generate via Lovable AI, with loading + editable outputs
-- Chatbot supports multiple threads on dedicated URLs, persists in localStorage, restores on reload
-- Recent outputs visible on dashboard and per module
-- Responsible AI disclaimer always visible
-- Works cleanly on desktop, tablet, mobile
-
-## Technical notes
-- `attachSupabaseAuth` not needed (no auth)
-- AI key handled server-side only; never exposed to client
-- Use `Output.object` schemas for summarizer/planner/research to get structured rendering
-- `stepCountIs(50)` if any tool loops added later (none in v1)
+- In-browser recording (per user choice: upload-only).
+- Speaker diarization / timestamps.
+- Streaming transcription.
+- Translating arbitrary user-picked target languages (only EN ↔ detected).
