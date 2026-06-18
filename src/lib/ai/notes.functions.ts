@@ -3,7 +3,10 @@ import { generateText, Output } from "ai";
 import { z } from "zod";
 import { createLovableAiGatewayProvider } from "../ai-gateway.server";
 
-const Input = z.object({ notes: z.string().min(10).max(20000) });
+const Input = z.object({
+  notes: z.string().min(10).max(20000),
+  language: z.string().min(2).max(40).optional(),
+});
 
 const Schema = z.object({
   summary: z.string(),
@@ -27,10 +30,10 @@ export const summarizeNotes = createServerFn({ method: "POST" })
     const key = process.env.LOVABLE_API_KEY;
     if (!key) throw new Error("Missing LOVABLE_API_KEY");
     const gateway = createLovableAiGatewayProvider(key);
+    const language = data.language?.trim() || "English";
     const { output } = await generateText({
       model: gateway("google/gemini-3-flash-preview"),
-      system:
-        "You summarize meeting notes/transcripts. Return a concise summary, key points, decisions, action items with owners and deadlines when available, and any important deadlines mentioned. If something is not present, return an empty array.",
+      system: `You summarize meeting notes/transcripts. Return a concise summary, key points, decisions, action items with owners and deadlines when available, and any important deadlines mentioned. If something is not present, return an empty array. Write every text field (summary, keyPoints, decisions, action items, deadlines) in ${language}, regardless of the input language.`,
       prompt: data.notes,
       experimental_output: Output.object({ schema: Schema }),
     });
